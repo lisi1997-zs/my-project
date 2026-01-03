@@ -1,0 +1,56 @@
+version: "4.1"
+name: "111111"
+type: C51
+deviceName: null
+packDir: null
+srcDirs: []
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders:
+    - name: Source Group 1
+      files:
+        - path: STARTUP.A51
+        - path: common.h
+        - path: ds1302.c
+        - path: ds1302.h
+        - path: lcd1602.c
+        - path: lcd1602.h
+        - path: main.c
+      folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: 75842a30c9abc474b1ee5719c7f83d9f
+targets:
+  Target_1:
+    cppPreprocessAttrs:
+      defineList: []
+      incList:
+        - ../../ARMMDK/mdkarm/C51/INC/STC
+      libList: []
+    excludeList: []
+    toolchain: Keil_C51
+    toolchainConfigMap:
+      Keil_C51:
+        options:
+          version: 2
+          afterBuildTasks: []
+          asm-compiler: {}
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            optimization-level: level-8
+            optimization-type: SPEED
+          global:
+            ram-mode: SMALL
+            rom-mode: LARGE
+          linker:
+            misc-controls: ""
+            output-format: elf
+            remove-unused: true
+    uploadConfigMap:
+      Custom:
+        bin: ""
+        commandLine: ""
+        eraseChipCommand: ""
+    uploader: Custom
