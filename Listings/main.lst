@@ -1,0 +1,792 @@
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 1   
+
+
+C51 COMPILER V9.60.7.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: D:\ARMMDK\mdkarm\C51\BIN\C51.EXE main.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listing
+                    -s\main.lst) TABS(2) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          #include "reg52.h"
+   2          #include "lcd1602.h"
+   3          #include "ds1302.h"
+   4          #include "common.h"
+   5          
+   6          // 按键定义
+   7          sbit KEY_MODE  = P3^1;  // K1 - 模式切换/退出
+   8          sbit KEY_SEL   = P3^0;  // K2 - 选择位置
+   9          sbit KEY_UP    = P3^2;  // K3 - 增加
+  10          sbit KEY_DOWN  = P3^3;  // K4 - 减少
+  11          sbit BEEP      = P2^0;
+  12          
+  13          u8 Time[7];
+  14          u8 Temp_Time[7];
+  15          u8 Alarm_Hour = 7;
+  16          u8 Alarm_Min  = 0;
+  17          u8 alarm_triggered = 0;
+  18          u8 alarm_duration = 0;
+  19          u8 alarm_enabled = 1; // 0: off, 1: on (persisted to DS1302 RAM 0)
+  20          
+  21          u8 mode = 0;           // 0:显示时间, 1:显示闹钟, 2:设置闹钟, 3:设置时间
+  22          u8 set_time_index = 0; // 时间设置项索引
+  23          u8 setting_mode = 0;   // 0:正常, 1:设置中
+  24          u8 alarm_edit_pos = 0; // 0:编辑小时, 1:编辑分钟
+  25          u8 key_press_time = 0;
+  26          u8 fast_mode = 0;
+  27          // 如果 RTC 数据不可信，开机时会强制进入设置模式
+  28          u8 rtc_invalid_start = 0;
+  29          u8 suppress_lcd = 0; // 兼容旧逻辑（现在不再长期抑制 LCD 更新）
+  30          // 非阻塞蜂鸣控制（闹钟响铃期间使用）
+  31          u8 alarm_beep_active = 0;
+  32          u8 alarm_beep_tick = 0;
+  33          u8 alarm_lcd_tick = 0;
+  34          u8 hour_mode = 0;      // 0: 24小时制, 1: 12小时制
+  35          u8 hourly_chime = 0;   // 0: 关闭整点报时, 1: 开启
+  36          
+  37          
+  38          #define RAM_CHECK_ADDR  0x00  // 存放校验暗号
+  39          #define RAM_ALARM_H     0x01  // 存放闹钟时
+  40          #define RAM_ALARM_M     0x02  // 存放闹钟分
+  41          #define RAM_ALARM_EN    0x03  // 存放闹钟开关
+  42          #define RAM_HOUR_MODE   0x04
+  43          #define RAM_HOURLY_EN   0x05
+  44          // DelayMs 原型（在文件顶部声明以避免在使用前编译器报错）
+  45          void DelayMs(u16 ms);
+  46          
+  47          // 在闹钟首次触发时生成短促蜂鸣脉冲（阻塞），提高被动/有源蜂鸣器触发概率
+  48          void AlarmBeepBurst() {
+  49   1          unsigned char i;
+  50   1          // 确保 LCD 被抑制
+  51   1          suppress_lcd = 1;
+  52   1          for(i = 0; i < 6; i++) {
+  53   2              BEEP = 0;
+  54   2              DelayMs(40);
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 2   
+
+  55   2              BEEP = 1;
+  56   2              DelayMs(40);
+  57   2          }
+  58   1      }
+  59          
+  60          // 校验从 RTC 读取的 BCD 时间是否在合理范围
+  61          u8 BCD_to_Decimal(u8 bcd);
+  62          u8 Decimal_to_BCD(u8 decimal);
+  63          u8 IsTimeValid(unsigned char *t) {
+  64   1          u8 sec = BCD_to_Decimal(t[0]);
+  65   1          u8 min = BCD_to_Decimal(t[1]);
+  66   1          u8 hour = BCD_to_Decimal(t[2]);
+  67   1          u8 day = BCD_to_Decimal(t[3]);
+  68   1          u8 month = BCD_to_Decimal(t[4]);
+  69   1          u8 week = BCD_to_Decimal(t[5]);
+  70   1          u8 year = BCD_to_Decimal(t[6]);
+  71   1      
+  72   1          if(sec > 59) return 0;
+  73   1          if(min > 59) return 0;
+  74   1          if(hour > 23) return 0;
+  75   1          if(day < 1 || day > 31) return 0;
+  76   1          if(month < 1 || month > 12) return 0;
+  77   1          if(week < 1 || week > 7) return 0;
+  78   1          if(year > 99) return 0;
+  79   1          return 1;
+  80   1      }
+  81          
+  82          // BCD转十进制
+  83          u8 BCD_to_Decimal(u8 bcd) {
+  84   1          return ((bcd >> 4) * 10) + (bcd & 0x0F);
+  85   1      }
+  86          
+  87          // 十进制转BCD
+  88          u8 Decimal_to_BCD(u8 decimal) {
+  89   1          return ((decimal / 10) << 4) | (decimal % 10);
+  90   1      }
+  91          
+  92          void DelayMs(u16 ms) {
+  93   1          u16 i, j;
+  94   1          for(i = 0; i < ms; i++)
+  95   1              for(j = 0; j < 120; j++);
+  96   1      }
+  97          
+  98          // 按键检测
+  99          u8 KeyScan() {
+ 100   1          static u8 key_pressed = 0;
+ 101   1          u8 key = 0;
+ 102   1          
+ 103   1          if(KEY_MODE == 0) key = 1;
+ 104   1          else if(KEY_SEL == 0) key = 2;
+ 105   1          else if(KEY_UP == 0) key = 3;
+ 106   1          else if(KEY_DOWN == 0) key = 4;
+ 107   1          
+ 108   1          if(key != 0) {
+ 109   2              if(!key_pressed) {
+ 110   3                  key_pressed = 1;
+ 111   3                  key_press_time = 0;
+ 112   3                  fast_mode = 0;
+ 113   3                  return key;
+ 114   3              } else {
+ 115   3                  key_press_time++;
+ 116   3                  if(key_press_time > 30) {
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 3   
+
+ 117   4                      fast_mode = 1;
+ 118   4                      if((key_press_time % 5) == 0) {
+ 119   5                          return key;
+ 120   5                      }
+ 121   4                  }
+ 122   3              }
+ 123   2          } else {
+ 124   2              key_pressed = 0;
+ 125   2              key_press_time = 0;
+ 126   2              fast_mode = 0;
+ 127   2          }
+ 128   1          
+ 129   1          return 0;
+ 130   1      }
+ 131          
+ 132          void CheckAlarm() {
+ 133   1          u8 hour = BCD_to_Decimal(Time[2]);
+ 134   1          u8 min = BCD_to_Decimal(Time[1]);
+ 135   1          u8 sec = BCD_to_Decimal(Time[0]);
+ 136   1          // 触发条件：闹钟开启且小时/分钟匹配，且秒数在 0..5 范围内
+ 137   1          if(alarm_enabled) {
+ 138   2              if(hour == Alarm_Hour && min == Alarm_Min) {
+ 139   3                  if(sec <= 5) {
+ 140   4                      if(!alarm_triggered) {
+ 141   5                          alarm_triggered = 1;
+ 142   5                          alarm_duration = 0;
+ 143   5                          BEEP = 0; // 低电平有效，开始蜂鸣
+ 144   5                          // 启动非阻塞蜂鸣循环并重置计数器
+ 145   5                          alarm_beep_active = 1;
+ 146   5                          alarm_beep_tick = 0;
+ 147   5                          alarm_lcd_tick = 0;
+ 148   5                      }
+ 149   4                  }
+ 150   3              }
+ 151   2          }
+ 152   1          
+ 153   1          if(alarm_triggered) {
+ 154   2              alarm_duration++;
+ 155   2              if(alarm_duration >= 300) { // 30秒后自动关闭
+ 156   3                  alarm_triggered = 0;
+ 157   3                  alarm_duration = 0;
+ 158   3                  BEEP = 1;
+ 159   3                  // 关闭非阻塞蜂鸣并允许正常显示刷新
+ 160   3                  alarm_beep_active = 0;
+ 161   3              }
+ 162   2          }
+ 163   1          
+ 164   1          // 任何按键都可以关闭闹钟
+ 165   1          if(alarm_triggered && (KEY_MODE == 0 || KEY_SEL == 0 || KEY_UP == 0 || KEY_DOWN == 0)) {
+ 166   2              alarm_triggered = 0;
+ 167   2              alarm_duration = 0;
+ 168   2              BEEP = 1;
+ 169   2              // 用户按键关闭闹钟，停止蜂鸣并刷新屏幕
+ 170   2              alarm_beep_active = 0;
+ 171   2              LCD_WriteCmd(0x01);
+ 172   2              DelayMs(200); // 消抖
+ 173   2          }
+ 174   1      }
+ 175          
+ 176          // 时间显示
+ 177          // --- 【修改后的显示时间函数】 ---
+ 178          void DisplayTime() {
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 4   
+
+ 179   1          u8 h24, h12;
+ 180   1          DS1302_ReadTime(Time); // 读取最新时间
+ 181   1          
+ 182   1          // 第一行显示日期
+ 183   1          LCD_ShowString(0, 0, "20");
+ 184   1          LCD_ShowNum(0, 2, BCD_to_Decimal(Time[6]), 2);
+ 185   1          LCD_ShowString(0, 4, "-");
+ 186   1          LCD_ShowNum(0, 5, BCD_to_Decimal(Time[4]), 2);
+ 187   1          LCD_ShowString(0, 7, "-");
+ 188   1          LCD_ShowNum(0, 8, BCD_to_Decimal(Time[3]), 2);
+ 189   1          LCD_ShowString(0, 11, "W");
+ 190   1          LCD_ShowNum(0, 12, BCD_to_Decimal(Time[5]), 1);
+ 191   1          
+ 192   1          // 显示整点报时图标 (右上角显示一个 C 代表 Chime，或者空)
+ 193   1          if(hourly_chime) LCD_ShowString(0, 15, "C");
+ 194   1          else LCD_ShowString(0, 15, " ");
+ 195   1      
+ 196   1          // 第二行显示时间 (核心逻辑)
+ 197   1          h24 = BCD_to_Decimal(Time[2]); // 获取24小时制的十进制小时
+ 198   1          
+ 199   1          if(hour_mode == 0) {
+ 200   2              // --- 24小时制模式 ---
+ 201   2              LCD_ShowNum(1, 0, h24, 2);
+ 202   2              LCD_ShowString(1, 2, ":");
+ 203   2              LCD_ShowNum(1, 3, BCD_to_Decimal(Time[1]), 2);
+ 204   2              LCD_ShowString(1, 5, ":");
+ 205   2              LCD_ShowNum(1, 6, BCD_to_Decimal(Time[0]), 2);
+ 206   2              LCD_ShowString(1, 9, "       "); // 清空后面的 AM/PM 区域
+ 207   2          } else {
+ 208   2              // --- 12小时制模式 ---
+ 209   2              // 计算 12 小时制数值
+ 210   2              if(h24 == 0) h12 = 12;      // 0点是 12 AM
+ 211   2              else if(h24 <= 12) h12 = h24; 
+ 212   2              else h12 = h24 - 12;        // 13-23点 减12
+ 213   2              
+ 214   2              LCD_ShowNum(1, 0, h12, 2);
+ 215   2              LCD_ShowString(1, 2, ":");
+ 216   2              LCD_ShowNum(1, 3, BCD_to_Decimal(Time[1]), 2);
+ 217   2              LCD_ShowString(1, 5, ":");
+ 218   2              LCD_ShowNum(1, 6, BCD_to_Decimal(Time[0]), 2);
+ 219   2              
+ 220   2              // 显示 AM 或 PM
+ 221   2              if(h24 < 12) LCD_ShowString(1, 9, " AM");
+ 222   2              else LCD_ShowString(1, 9, " PM");
+ 223   2          }
+ 224   1      }
+ 225          
+ 226          // 闹钟显示界面
+ 227          void DisplayAlarm() {
+ 228   1          DS1302_ReadTime(Time);
+ 229   1          
+ 230   1          LCD_ShowString(0, 0, "20");
+ 231   1          LCD_ShowNum(0, 2, BCD_to_Decimal(Time[6]), 2);
+ 232   1          LCD_ShowString(0, 4, "-");
+ 233   1          LCD_ShowNum(0, 5, BCD_to_Decimal(Time[4]), 2);
+ 234   1          LCD_ShowString(0, 7, "-");
+ 235   1          LCD_ShowNum(0, 8, BCD_to_Decimal(Time[3]), 2);
+ 236   1          LCD_ShowString(0, 13, "W");
+ 237   1          LCD_ShowNum(0, 14, BCD_to_Decimal(Time[5]), 1);
+ 238   1          
+ 239   1          LCD_ShowString(1, 0, "Alarm:");
+ 240   1          LCD_ShowNum(1, 7, Alarm_Hour, 2);
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 5   
+
+ 241   1          LCD_ShowString(1, 9, ":");
+ 242   1          LCD_ShowNum(1, 10, Alarm_Min, 2);
+ 243   1          if(alarm_triggered) {
+ 244   2              LCD_ShowString(1, 13, "RING");
+ 245   2          } else {
+ 246   2              if(alarm_enabled) LCD_ShowString(1, 13, "ON ");
+ 247   2              else LCD_ShowString(1, 13, "OFF");
+ 248   2          }
+ 249   1      }
+ 250          
+ 251          // 设置闹钟界面
+ 252          void DisplaySetAlarm() {
+ 253   1          LCD_ShowString(0, 0, "Set Alarm Time  ");
+ 254   1          
+ 255   1          if(alarm_edit_pos == 0) {
+ 256   2              LCD_ShowString(1, 0, ">");
+ 257   2              LCD_ShowNum(1, 2, Alarm_Hour, 2);
+ 258   2              LCD_ShowString(1, 4, ":");
+ 259   2              LCD_ShowNum(1, 6, Alarm_Min, 2);
+ 260   2              LCD_ShowString(1, 9, "Hour  ");
+ 261   2          } else {
+ 262   2              LCD_ShowString(1, 0, " ");
+ 263   2              LCD_ShowNum(1, 2, Alarm_Hour, 2);
+ 264   2              LCD_ShowString(1, 4, ":");
+ 265   2              LCD_ShowString(1, 6, ">");
+ 266   2              LCD_ShowNum(1, 7, Alarm_Min, 2);
+ 267   2              LCD_ShowString(1, 9, "Minute");
+ 268   2          }
+ 269   1      }
+ 270          
+ 271          // 设置时间界面
+ 272          // 设置时间界面
+ 273          // 设置时间界面
+ 274          // 设置时间界面
+ 275          void DisplaySetTime() {
+ 276   1          u8 hour, min, day, month, year, week;
+ 277   1          
+ 278   1          if(setting_mode) {
+ 279   2              hour = BCD_to_Decimal(Temp_Time[2]);
+ 280   2              min = BCD_to_Decimal(Temp_Time[1]);
+ 281   2              day = BCD_to_Decimal(Temp_Time[3]);
+ 282   2              month = BCD_to_Decimal(Temp_Time[4]);
+ 283   2              year = BCD_to_Decimal(Temp_Time[6]);  // 使用 Temp_Time 里的年份 (t[6]=year)
+ 284   2              week = BCD_to_Decimal(Temp_Time[5]); // 星期在 t[5]
+ 285   2          } else {
+ 286   2              DS1302_ReadTime(Time);
+ 287   2              hour = BCD_to_Decimal(Time[2]);
+ 288   2              min = BCD_to_Decimal(Time[1]);
+ 289   2              day = BCD_to_Decimal(Time[3]);
+ 290   2              month = BCD_to_Decimal(Time[4]);
+ 291   2              year = BCD_to_Decimal(Time[6]);  // 使用 Time 里的年份 (t[6]=year)
+ 292   2              week = BCD_to_Decimal(Time[5]);
+ 293   2          }
+ 294   1          
+ 295   1          LCD_ShowString(0, 0, "Set System Time ");
+ 296   1          
+ 297   1          switch(set_time_index) {
+ 298   2              case 0: // 年
+ 299   2                  LCD_ShowString(1, 0, ">Year: 20");
+ 300   2                  LCD_ShowNum(1, 9, year, 2);  // 显示修改后的年份
+ 301   2                  LCD_ShowString(1, 11, "     ");
+ 302   2                  break;
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 6   
+
+ 303   2              case 1: // 月
+ 304   2                  LCD_ShowString(1, 0, ">Month:  ");
+ 305   2                  LCD_ShowNum(1, 8, month, 2);
+ 306   2                  LCD_ShowString(1, 10, "     ");
+ 307   2                  break;
+ 308   2              case 2: // 日
+ 309   2                  LCD_ShowString(1, 0, ">Day:    ");
+ 310   2                  LCD_ShowNum(1, 8, day, 2);
+ 311   2                  LCD_ShowString(1, 10, "     ");
+ 312   2                  break;
+ 313   2              case 3: // 时
+ 314   2                  LCD_ShowString(1, 0, ">Hour:   ");
+ 315   2                  LCD_ShowNum(1, 8, hour, 2);
+ 316   2                  LCD_ShowString(1, 10, "     ");
+ 317   2                  break;
+ 318   2              case 4: // 分
+ 319   2                  LCD_ShowString(1, 0, ">Minute: ");
+ 320   2                  LCD_ShowNum(1, 8, min, 2);
+ 321   2                  LCD_ShowString(1, 10, "     ");
+ 322   2                  break;
+ 323   2              case 5: // 星期
+ 324   2                  LCD_ShowString(1, 0, ">Week:   ");
+ 325   2                  LCD_ShowNum(1, 8, week, 1);
+ 326   2                  LCD_ShowString(1, 9, "      ");
+ 327   2                  break;
+ 328   2          }
+ 329   1      }
+ 330          
+ 331          // 主循环
+ 332          void main() {
+ 333   1          u8 key;
+ 334   1          u8 i;
+ 335   1      
+ 336   1          LCD_Init();
+ 337   1          DS1302_Init();
+ 338   1          BEEP = 1;
+ 339   1      // 1. 尝试读取“暗号”和闹钟数据
+ 340   1          if(DS1302_ReadRam(RAM_CHECK_ADDR) == 0xAA) {
+ 341   2              // 说明电池一直有电，直接把存好的闹钟拿出来用
+ 342   2              Alarm_Hour    = DS1302_ReadRam(RAM_ALARM_H);
+ 343   2              Alarm_Min     = DS1302_ReadRam(RAM_ALARM_M);
+ 344   2              alarm_enabled = DS1302_ReadRam(RAM_ALARM_EN);
+ 345   2          } else {
+ 346   2              // 说明是第一次用（比如刚买的电池），先写一份默认值进去
+ 347   2              DS1302_WriteRam(RAM_CHECK_ADDR, 0xAA);  // 种下暗号
+ 348   2              DS1302_WriteRam(RAM_ALARM_H, Alarm_Hour);
+ 349   2              DS1302_WriteRam(RAM_ALARM_M, Alarm_Min);
+ 350   2              DS1302_WriteRam(RAM_ALARM_EN, alarm_enabled);
+ 351   2          }
+ 352   1      
+ 353   1          // 2. 检查 RTC 时间是否乱码（无电池上电通常返回全0或垃圾值数据）
+ 354   1          DS1302_ReadTime(Time);
+ 355   1          if(!IsTimeValid(Time)) {
+ 356   2              // 时间不对，提示用户重新设表
+ 357   2              rtc_invalid_start = 1;
+ 358   2              LCD_ShowString(0, 0, " RTC Invalid!   ");
+ 359   2              LCD_ShowString(1, 0, " Please Set Time ");
+ 360   2              DelayMs(1500);
+ 361   2              LCD_WriteCmd(0x01);
+ 362   2      
+ 363   2              // 自动跳转到设置时间模式 (Mode 3)
+ 364   2              mode = 3;
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 7   
+
+ 365   2              setting_mode = 1;
+ 366   2              set_time_index = 0;
+ 367   2              
+ 368   2              // 给出一组默认时间供修改
+ 369   2              Temp_Time[0] = Decimal_to_BCD(0); // 秒
+ 370   2              Temp_Time[1] = Decimal_to_BCD(0); // 分
+ 371   2              Temp_Time[2] = Decimal_to_BCD(12);// 时（默认中午12点）
+ 372   2              Temp_Time[3] = Decimal_to_BCD(1); // 日
+ 373   2              Temp_Time[4] = Decimal_to_BCD(1); // 月
+ 374   2              Temp_Time[5] = Decimal_to_BCD(1); // 周
+ 375   2              Temp_Time[6] = Decimal_to_BCD(25);// 年 (2025年)
+ 376   2          } else {
+ 377   2              // 时间正常，正常开机
+ 378   2              LCD_ShowString(0, 0, "  Smart Clock   ");
+ 379   2              LCD_ShowString(1, 0, "  Starting...   ");
+ 380   2              DelayMs(1000);
+ 381   2              LCD_WriteCmd(0x01);
+ 382   2          }
+ 383   1      
+ 384   1          if(DS1302_ReadRam(RAM_CHECK_ADDR) == 0xAA) {
+ 385   2              hour_mode = DS1302_ReadRam(RAM_HOUR_MODE);
+ 386   2              hourly_chime = DS1302_ReadRam(RAM_HOURLY_EN);
+ 387   2          } else {
+ 388   2              // 如果是新电池，初始化为默认值并保存
+ 389   2              DS1302_WriteRam(RAM_HOUR_MODE, 0);   // 默认 24小时制
+ 390   2              DS1302_WriteRam(RAM_HOURLY_EN, 0);   // 默认 关闭整点报时
+ 391   2          }
+ 392   1          
+ 393   1          while(1) {
+ 394   2              // 如果不是设置时间模式，则始终读取最新时间
+ 395   2              if(!(mode == 3 && setting_mode)) {
+ 396   3                  DS1302_ReadTime(Time);  // 确保在非设置模式下读取最新时间
+ 397   3              }
+ 398   2      
+ 399   2              key = KeyScan();
+ 400   2      
+ 401   2              // 处理模式切换 (K1键)
+ 402   2              if(key == 1 && !setting_mode) {
+ 403   3                  mode++;
+ 404   3                  if(mode > 3) mode = 0;
+ 405   3                  LCD_WriteCmd(0x01); // 清除屏幕
+ 406   3              }
+ 407   2      
+ 408   2      switch(mode) {
+ 409   3                  case 0:  // 显示时间模式
+ 410   3                      if(!suppress_lcd) DisplayTime();
+ 411   3                      
+ 412   3                      // --- 【新增：模式 0 下的快捷键】 ---
+ 413   3                      // 按 K3 (UP) 切换 12/24 小时制
+ 414   3                      if(key == 3) {
+ 415   4                          hour_mode = !hour_mode; // 切换状态
+ 416   4                          DS1302_WriteRam(RAM_HOUR_MODE, hour_mode); // 立即保存
+ 417   4                          LCD_WriteCmd(0x01); // 清屏刷新
+ 418   4                      }
+ 419   3                      
+ 420   3                      // 按 K4 (DOWN) 切换整点报时
+ 421   3                      if(key == 4) {
+ 422   4                          hourly_chime = !hourly_chime; // 切换状态
+ 423   4                          DS1302_WriteRam(RAM_HOURLY_EN, hourly_chime); // 立即保存
+ 424   4                          // 蜂鸣器叫一声提示状态变化
+ 425   4                          BEEP = 0; DelayMs(100); BEEP = 1; 
+ 426   4                      }
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 8   
+
+ 427   3                      // -----------------------------------
+ 428   3                      break;
+ 429   3                      
+ 430   3                  case 1:  // 显示闹钟模式
+ 431   3                      if(!suppress_lcd) DisplayAlarm();
+ 432   3                      // 方便调试：在闹钟显示界面按 KEY_UP (K3) 可以手动切换闹钟响铃状�
+             -�
+ 433   3                      if(!setting_mode && key == 3) {
+ 434   4                          if(!alarm_triggered) {
+ 435   5                              // 启动闹钟（与自动触发一致的非阻塞行为）
+ 436   5                              alarm_triggered = 1;
+ 437   5                              alarm_duration = 0;
+ 438   5                              BEEP = 0; // 启动蜂鸣器（低电平有效）
+ 439   5                              alarm_beep_active = 1;
+ 440   5                              alarm_beep_tick = 0;
+ 441   5                              alarm_lcd_tick = 0;
+ 442   5                              // 等待按键释放，避免同次按键被检测为关闭闹钟
+ 443   5                              while(KEY_UP == 0) DelayMs(10);
+ 444   5                          } else {
+ 445   5                              // 如果已经在响铃，按一次停止（与其他按键行为一致）
+ 446   5                              alarm_triggered = 0;
+ 447   5                              alarm_duration = 0;
+ 448   5                              BEEP = 1;
+ 449   5                              alarm_beep_active = 0;
+ 450   5                              LCD_WriteCmd(0x01);
+ 451   5                              DelayMs(200);
+ 452   5                          }
+ 453   4                      }
+ 454   3                      // 在闹钟显示界面按 KEY_SEL (K2) 切换闹钟开关并持久保存
+ 455   3                      if(!setting_mode && key == 2) {
+ 456   4                          alarm_enabled = !alarm_enabled;
+ 457   4                          // 持久化到 DS1302 的 RAM 0
+ 458   4                          DS1302_WriteRam(0, alarm_enabled ? 0x01 : 0x00);
+ 459   4                          if(alarm_enabled) {
+ 460   5                              LCD_ShowString(0, 0, " Alarm: ON     ");
+ 461   5                          } else {
+ 462   5                              LCD_ShowString(0, 0, " Alarm: OFF    ");
+ 463   5                          }
+ 464   4                          DelayMs(800);
+ 465   4                          LCD_WriteCmd(0x01);
+ 466   4                      }
+ 467   3                      break;
+ 468   3                      
+ 469   3                  case 2:  // 设置闹钟模式
+ 470   3                      if(!setting_mode) {
+ 471   4                          DisplaySetAlarm();
+ 472   4                          if(key == 1) {
+ 473   5                            
+ 474   5                              setting_mode = 1;
+ 475   5                              alarm_edit_pos = 0;
+ 476   5                              LCD_WriteCmd(0x01);
+ 477   5                          }
+ 478   4                      } else {
+ 479   4                          DisplaySetAlarm();
+ 480   4                          
+ 481   4                          if(key == 2) {
+ 482   5                              alarm_edit_pos = !alarm_edit_pos;
+ 483   5                              DelayMs(200);
+ 484   5                          }
+ 485   4                          
+ 486   4                          if(key == 3) {
+ 487   5                              if(alarm_edit_pos == 0) {
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 9   
+
+ 488   6                                  Alarm_Hour++;
+ 489   6                                  if(Alarm_Hour >= 24) Alarm_Hour = 0;
+ 490   6                              } else {
+ 491   6                                  Alarm_Min++;
+ 492   6                                  if(Alarm_Min >= 60) Alarm_Min = 0;
+ 493   6                              }
+ 494   5                              if(!fast_mode) DelayMs(200);
+ 495   5                          }
+ 496   4                          
+ 497   4                          if(key == 4) {
+ 498   5                              if(alarm_edit_pos == 0) {
+ 499   6                                  if(Alarm_Hour == 0) Alarm_Hour = 23;
+ 500   6                                  else Alarm_Hour--;
+ 501   6                              } else {
+ 502   6                                  if(Alarm_Min == 0) Alarm_Min = 59;
+ 503   6                                  else Alarm_Min--;
+ 504   6                              }
+ 505   5                              if(!fast_mode) DelayMs(200);
+ 506   5                          }
+ 507   4                          
+ 508   4                          if(key == 1) {
+ 509   5                            DS1302_WriteRam(1, Alarm_Hour);
+ 510   5                  DS1302_WriteRam(2, Alarm_Min);
+ 511   5                  DS1302_WriteRam(3, alarm_enabled);
+ 512   5                              setting_mode = 0;
+ 513   5                              LCD_ShowString(0, 0, " Alarm Saved!   ");
+ 514   5                              LCD_ShowString(1, 0, "                ");
+ 515   5                              DelayMs(1000);
+ 516   5                              LCD_WriteCmd(0x01);
+ 517   5                          }
+ 518   4                      }
+ 519   3                      break;
+ 520   3                      
+ 521   3                  case 3:  // 设置系统时间模式
+ 522   3                      if(!setting_mode) {
+ 523   4                          DisplaySetTime();
+ 524   4                          if(key == 1) {
+ 525   5                              setting_mode = 1;
+ 526   5                              set_time_index = 0;
+ 527   5                              // 保存当前时间到 Temp_Time 数组
+ 528   5                              for(i = 0; i < 7; i++) {
+ 529   6                                  Temp_Time[i] = Time[i];
+ 530   6                              }
+ 531   5                              LCD_WriteCmd(0x01);
+ 532   5                          }
+ 533   4                      } else {
+ 534   4                          DisplaySetTime();
+ 535   4                          
+ 536   4                          if(key == 2) {
+ 537   5                              set_time_index++;
+ 538   5                              if(set_time_index > 5) set_time_index = 0;
+ 539   5                              DelayMs(200);
+ 540   5                          }
+ 541   4                          
+ 542   4                          if(key == 3) {
+ 543   5                              switch(set_time_index) {
+ 544   6                                  case 0: // 年
+ 545   6                                          {
+ 546   7                                              u8 v = BCD_to_Decimal(Temp_Time[6]);
+ 547   7                                              v++;
+ 548   7                                              if(v > 99) v = 0;
+ 549   7                                              Temp_Time[6] = Decimal_to_BCD(v);
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 10  
+
+ 550   7                                          }
+ 551   6                                      break;
+ 552   6                                  case 1: // 月
+ 553   6                                          {
+ 554   7                                              u8 v = BCD_to_Decimal(Temp_Time[4]);
+ 555   7                                              v++;
+ 556   7                                              if(v > 12) v = 1;
+ 557   7                                              Temp_Time[4] = Decimal_to_BCD(v);
+ 558   7                                          }
+ 559   6                                      break;
+ 560   6                                  case 2: // 日
+ 561   6                                          {
+ 562   7                                              u8 v = BCD_to_Decimal(Temp_Time[3]);
+ 563   7                                              v++;
+ 564   7                                              if(v > 31) v = 1;
+ 565   7                                              Temp_Time[3] = Decimal_to_BCD(v);
+ 566   7                                          }
+ 567   6                                      break;
+ 568   6                                  case 3: // 时
+ 569   6                                          {
+ 570   7                                              u8 v = BCD_to_Decimal(Temp_Time[2]);
+ 571   7                                              v++;
+ 572   7                                              if(v >= 24) v = 0;
+ 573   7                                              Temp_Time[2] = Decimal_to_BCD(v);
+ 574   7                                          }
+ 575   6                                      break;
+ 576   6                                  case 4: // 分
+ 577   6                                          {
+ 578   7                                              u8 v = BCD_to_Decimal(Temp_Time[1]);
+ 579   7                                              v++;
+ 580   7                                              if(v >= 60) v = 0;
+ 581   7                                              Temp_Time[1] = Decimal_to_BCD(v);
+ 582   7                                          }
+ 583   6                                      break;
+ 584   6                                  case 5: // 星期
+ 585   6                                          {
+ 586   7                                              u8 v = BCD_to_Decimal(Temp_Time[5]);
+ 587   7                                              v++;
+ 588   7                                              if(v > 7) v = 1;
+ 589   7                                              Temp_Time[5] = Decimal_to_BCD(v);
+ 590   7                                          }
+ 591   6                                      break;
+ 592   6                              }
+ 593   5                              if(!fast_mode) DelayMs(200);
+ 594   5                          }
+ 595   4                          
+ 596   4                          if(key == 4) {
+ 597   5                              switch(set_time_index) {
+ 598   6                                  case 0: // 年
+ 599   6                                          {
+ 600   7                                              u8 v = BCD_to_Decimal(Temp_Time[6]);
+ 601   7                                              if(v == 0) v = 99;
+ 602   7                                              else v--;
+ 603   7                                              Temp_Time[6] = Decimal_to_BCD(v);
+ 604   7                                          }
+ 605   6                                      break;
+ 606   6                                  case 1: // 月
+ 607   6                                          {
+ 608   7                                              u8 v = BCD_to_Decimal(Temp_Time[4]);
+ 609   7                                              if(v == 1) v = 12;
+ 610   7                                              else v--;
+ 611   7                                              Temp_Time[4] = Decimal_to_BCD(v);
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 11  
+
+ 612   7                                          }
+ 613   6                                      break;
+ 614   6                                  case 2: // 日
+ 615   6                                          {
+ 616   7                                              u8 v = BCD_to_Decimal(Temp_Time[3]);
+ 617   7                                              if(v == 1) v = 31;
+ 618   7                                              else v--;
+ 619   7                                              Temp_Time[3] = Decimal_to_BCD(v);
+ 620   7                                          }
+ 621   6                                      break;
+ 622   6                                  case 3: // 时
+ 623   6                                          {
+ 624   7                                              u8 v = BCD_to_Decimal(Temp_Time[2]);
+ 625   7                                              if(v == 0) v = 23;
+ 626   7                                              else v--;
+ 627   7                                              Temp_Time[2] = Decimal_to_BCD(v);
+ 628   7                                          }
+ 629   6                                      break;
+ 630   6                                  case 4: // 分
+ 631   6                                          {
+ 632   7                                              u8 v = BCD_to_Decimal(Temp_Time[1]);
+ 633   7                                              if(v == 0) v = 59;
+ 634   7                                              else v--;
+ 635   7                                              Temp_Time[1] = Decimal_to_BCD(v);
+ 636   7                                          }
+ 637   6                                      break;
+ 638   6                                  case 5: // 星期
+ 639   6                                          {
+ 640   7                                              u8 v = BCD_to_Decimal(Temp_Time[5]);
+ 641   7                                              if(v == 1) v = 7;
+ 642   7                                              else v--;
+ 643   7                                              Temp_Time[5] = Decimal_to_BCD(v);
+ 644   7                                          }
+ 645   6                                      break;
+ 646   6                              }
+ 647   5                              if(!fast_mode) DelayMs(200);
+ 648   5                          }
+ 649   4                          
+ 650   4                          if(key == 1) {
+ 651   5                              setting_mode = 0;
+ 652   5                              set_time_index = 0;
+ 653   5                              // 在写入 RTC 前校验十进制范围，防止未初始化或非法数据写�
+             -�
+ 654   5                              {
+ 655   6                                  u8 sec = BCD_to_Decimal(Temp_Time[0]);
+ 656   6                                  u8 min = BCD_to_Decimal(Temp_Time[1]);
+ 657   6                                  u8 hour = BCD_to_Decimal(Temp_Time[2]);
+ 658   6                                  u8 day = BCD_to_Decimal(Temp_Time[3]);
+ 659   6                                  u8 month = BCD_to_Decimal(Temp_Time[4]);
+ 660   6                                  u8 week = BCD_to_Decimal(Temp_Time[5]);
+ 661   6                                  u8 year = BCD_to_Decimal(Temp_Time[6]);
+ 662   6      
+ 663   6                                  if(sec > 59 || min > 59 || hour > 23 || day < 1 || day > 31 || month < 1 || mo
+             -nth > 12 || week < 1 || week > 7 || year > 99) {
+ 664   7                                      LCD_ShowString(0, 0, " Invalid Time!  ");
+ 665   7                                      LCD_ShowString(1, 0, " Save Aborted   ");
+ 666   7                                      DelayMs(1000);
+ 667   7                                      LCD_WriteCmd(0x01);
+ 668   7                                      // 不写入 RTC，恢复显示
+ 669   7                                      // 更新 Time 数组以保证界面同步
+ 670   7                                      for(i = 0; i < 7; i++) {
+ 671   8                                          Time[i] = Temp_Time[i];
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 12  
+
+ 672   8                                      }
+ 673   7                                      break;
+ 674   7                                  }
+ 675   6                              }
+ 676   5                              // 保存时间到 DS1302（通过校验后写入）
+ 677   5                              // 将秒归零以避免未设置的秒导致写入后显示异常
+ 678   5                              Temp_Time[0] = Decimal_to_BCD(0);
+ 679   5                              DS1302_SetTime(Temp_Time); // 写入 RTC
+ 680   5                              // 给 RTC 少许时间稳定，然后读回确认并刷新显示数据
+ 681   5                              DelayMs(200);
+ 682   5                              DS1302_ReadTime(Time);
+ 683   5                              // 如果读回值仍然非法，则退回使用刚保存的 Temp_Time
+ 684   5                              if(!IsTimeValid(Time)) {
+ 685   6                                  for(i = 0; i < 7; i++) {
+ 686   7                                      Time[i] = Temp_Time[i];
+ 687   7                                  }
+ 688   6                              }
+ 689   5                              // 保存完成后立即切换到时间显示页面并恢复正常运行
+ 690   5                              mode = 0;              // 切换到显示时间模式
+ 691   5                              rtc_invalid_start = 0; // 清除无效 RTC 标志（如有）
+ 692   5                              LCD_ShowString(0, 0, " Time Saved!    ");
+ 693   5                              LCD_ShowString(1, 0, "                ");
+ 694   5                              DelayMs(1000);
+ 695   5                              LCD_WriteCmd(0x01);
+ 696   5                          }
+ 697   4                      }
+ 698   3                      break;
+ 699   3              }
+ 700   2      
+ 701   2              CheckAlarm();
+ 702   2              {
+ 703   3                  static u8 last_hour_beep = 99; // 记录上次响铃时的秒数
+ 704   3                  u8 current_sec = BCD_to_Decimal(Time[0]);
+ 705   3                  u8 current_min = BCD_to_Decimal(Time[1]);
+ 706   3      
+ 707   3                  if(hourly_chime && current_min == 0 && current_sec == 0) {
+ 708   4                      if(last_hour_beep != current_sec) {
+ 709   5                          // 触发报时：嘀-嘀 两声
+ 710   5                          BEEP = 0; DelayMs(100); BEEP = 1; DelayMs(100);
+ 711   5                          BEEP = 0; DelayMs(100); BEEP = 1;
+ 712   5                          last_hour_beep = current_sec; // 标记这一秒已经响过了
+ 713   5                      }
+ 714   4                  } else {
+ 715   4                       if(current_sec != 0) last_hour_beep = 99; // 重置标记
+ 716   4                  }
+ 717   3              }
+ 718   2      
+ 719   2              // 非阻塞蜂鸣控制：如果处于闹钟响铃状态，以固定节拍切换 BEEP
+ 720   2              if(alarm_beep_active) {
+ 721   3                  alarm_beep_tick++;
+ 722   3                  if(alarm_beep_tick >= 2) { // 2 * 50ms = ~100ms 切换一次
+ 723   4                      alarm_beep_tick = 0;
+ 724   4                      BEEP = !BEEP;
+ 725   4                  }
+ 726   3                  // 周期性刷新屏幕（每 ~500ms）以保持显示更新
+ 727   3                  alarm_lcd_tick++;
+ 728   3                  if(alarm_lcd_tick >= 10) {
+ 729   4                      alarm_lcd_tick = 0;
+ 730   4                      // 如果当前在闹钟显示界面，刷新闹钟界面；否则刷新时间界面
+ 731   4                      if(mode == 1) DisplayAlarm();
+ 732   4                      else DisplayTime();
+ 733   4                  }
+C51 COMPILER V9.60.7.0   MAIN                                                              12/28/2025 08:47:58 PAGE 13  
+
+ 734   3              }
+ 735   2      
+ 736   2              DelayMs(50);
+ 737   2          }
+ 738   1      }
+ 739          
+ 740          
+ 741          
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   3289    ----
+   CONSTANT SIZE    =    358    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     34      27
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

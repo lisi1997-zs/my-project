@@ -1,0 +1,18 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE 文件
+.vscode/
+.idea/
+
+# 日志或临时文件
+*.log
+*.tmp
+*.exe
+
+# node_modules 或编译生成的文件夹（根据你的项目）
+node_modules/
+dist/
+build/
